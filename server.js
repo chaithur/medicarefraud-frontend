@@ -213,4 +213,22 @@ app.post("/predict/provider", auth, async (_req, res) => {
   res.json({ ok: true, note: "Provider route stubbed. Send the provider aggregation code to wire it." });
 });
 
+// server.js
+import {
+  SELECTED_FEATURES,
+  transformBatch,
+  diagnostics,
+  PREPROCESS_VERSION
+} from "./preprocess.js";
+
+// …after app.get("/health", …) add:
+app.get("/diag/preprocess", (_req, res) => {
+  try {
+    const d = diagnostics();
+    res.json({ ok: true, ...d, selected_features_head: SELECTED_FEATURES.slice(0, 5) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.listen(Number(PORT), () => console.log(`server.js listening on http://localhost:${PORT}`));
