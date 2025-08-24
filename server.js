@@ -1,4 +1,4 @@
-// server.js
+// server.js (ESM)
 import cors from "cors";
 import crypto from "crypto";
 import "dotenv/config";
@@ -7,7 +7,7 @@ import jwt from "jsonwebtoken";
 import { MongoClient } from "mongodb";
 import fetch from "node-fetch";
 
-// Preprocessor (loads preprocessing_bundle.json next to this file)
+// Preprocessor: uses preprocessing_bundle.json next to this file
 import { SELECTED_FEATURES, transformBatch } from "./preprocess.js";
 
 const app = express();
@@ -140,7 +140,7 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// --- Claim-level predict (JSON body; partial columns allowed)
+// --- Claim-level predict (accepts a single object or an array)
 app.post("/predict/claim", auth, async (req, res) => {
   try {
     if (!req.body || typeof req.body !== "object") {
@@ -151,68 +151,51 @@ app.post("/predict/claim", auth, async (req, res) => {
     }
     const rawRows = Array.isArray(req.body) ? req.body : [req.body];
 
-    // Keep only the columns that appear in SELECTED_FEATURES; missing ones become undefined/0
-    const sanitized = rawRows.map((row) => {
-      const r = {};
-      for (const k of SELECTED_FEATURES) {
-        if (Object.prototype.hasOwnProperty.call(row, k)) r[k] = row[k];
-      }
-      return r;
-    });
+    // Normalize + encode + scale + order (done inside preprocess.js)
+    const X = transformBatch(rawRows);
 
-    // Transform using your bundle (label encoders + scaler w/ null/NaN guards)
-    const X = transformBatch(sanitized);
-
-    // Force float & finite
-    const Xfloat = X.map((row) => row.map((v) => (Number.isFinite(v) ? Number(v) : 0)));
-
-    // AML payload (3 common schemas)
+    // Build AML payload
     let payload;
     switch ((AML_CLAIM_PAYLOAD_STYLE || "mlflow_split").toLowerCase()) {
-      case "mlflow_split":
+      case "mlflow":
+        payload = { input_data: { columns: SELECTED_FEATURES, data: X } };
+        break;
+      case "inputs":
+        payload = { inputs: X };
+        break;
+      default: // mlflow_split
         payload = {
           input_data: {
             columns: SELECTED_FEATURES,
-            index: Array.from({ length: Xfloat.length }, (_, i) => i),
-            data: Xfloat,
+            index: Array.from({ length: X.length }, (_, i) => i),
+            data: X,
           },
         };
-        break;
-      case "mlflow":
-        payload = { input_data: { columns: SELECTED_FEATURES, data: Xfloat } };
-        break;
-      default: // "inputs"
-        payload = { inputs: Xfloat };
     }
 
     const out = await callAML(AML_CLAIM_URI, AML_CLAIM_KEY, AML_CLAIM_DEPLOYMENT, payload);
     res.json({
       ok: true,
       predictions: out,
-      meta: { rows: Xfloat.length, cols: SELECTED_FEATURES.length, payloadStyle: AML_CLAIM_PAYLOAD_STYLE },
+      meta: { rows: X.length, cols: SELECTED_FEATURES.length, payloadStyle: AML_CLAIM_PAYLOAD_STYLE },
     });
   } catch (e) {
     res.status(502).json({
       error: "claim-scorer-failed",
       message: e.message,
       suggestions: [
-        "Ensure preprocessing_bundle.json is in the same folder as server.js.",
-        "If AML complains about schema, try AML_CLAIM_PAYLOAD_STYLE=mlflow_split (default), then mlflow, then inputs in .env.",
+        "Ensure preprocessing_bundle.json is beside server.js.",
+        "If AML complains about schema, try AML_CLAIM_PAYLOAD_STYLE=mlflow_split (default), then mlflow, then inputs.",
       ],
     });
   }
 });
 
-// --- Debug: show the numeric vectors we send to AML
+// --- Debug: returns the numeric vectors we send to AML
 app.post("/debug/transform-claim", auth, (req, res) => {
   try {
     const rawRows = Array.isArray(req.body) ? req.body : [req.body];
-    const sanitized = rawRows.map((row) => {
-      const r = {};
-      for (const k of SELECTED_FEATURES) if (k in row) r[k] = row[k];
-      return r;
-    });
-    const X = transformBatch(sanitized);
+    const X = transformBatch(rawRows);
     res.json({
       ok: true,
       selected_features: SELECTED_FEATURES,
@@ -225,7 +208,7 @@ app.post("/debug/transform-claim", auth, (req, res) => {
   }
 });
 
-// --- Provider-level predict (stub until you share the aggregator)
+// --- Provider-level predict (stub until aggregator is provided)
 app.post("/predict/provider", auth, async (_req, res) => {
   res.json({ ok: true, note: "Provider route stubbed. Send the provider aggregation code to wire it." });
 });
