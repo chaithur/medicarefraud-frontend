@@ -1,4 +1,5 @@
 // preprocess.js (ESM)
+console.log("✅ preprocess v2 loaded");
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
