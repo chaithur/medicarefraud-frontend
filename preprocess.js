@@ -147,3 +147,29 @@ export function transformBatch(rows) {
   if (!Array.isArray(rows)) throw new Error("transformBatch expects an array of objects");
   return rows.map(transformOne);
 }
+// preprocess.js
+export const PREPROCESS_VERSION = "v2.1";
+
+export function diagnostics() {
+  const meanLen  = Array.isArray(SCALER.mean_)  ? SCALER.mean_.length  : 0;
+  const scaleLen = Array.isArray(SCALER.scale_) ? SCALER.scale_.length : 0;
+  const sample = {
+    provider_PRV51001: LABEL_MAPS.Provider
+      ? (LABEL_MAPS.Provider.mapping["PRV51001"] ?? LABEL_MAPS.Provider.unknown_index ?? null)
+      : null,
+    icd_I10: LABEL_MAPS.ClmDiagnosisCode_1
+      ? (LABEL_MAPS.ClmDiagnosisCode_1.mapping["I10"] ?? LABEL_MAPS.ClmDiagnosisCode_1.unknown_index ?? null)
+      : null,
+    cpt_99213: LABEL_MAPS.ClmProcedureCode_1
+      ? (LABEL_MAPS.ClmProcedureCode_1.mapping["99213"] ?? LABEL_MAPS.ClmProcedureCode_1.unknown_index ?? null)
+      : null,
+  };
+  return {
+    version: PREPROCESS_VERSION,
+    features_len: SELECTED_FEATURES.length,
+    scaler_mean_len: meanLen,
+    scaler_scale_len: scaleLen,
+    sample_encodes: sample
+  };
+}
+
