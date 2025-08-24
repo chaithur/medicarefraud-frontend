@@ -1,0 +1,233 @@
+// server.js
+import cors from "cors";
+import crypto from "crypto";
+import "dotenv/config";
+import express from "express";
+import jwt from "jsonwebtoken";
+import { MongoClient } from "mongodb";
+import fetch from "node-fetch";
+
+// Preprocessor (loads preprocessing_bundle.json next to this file)
+import { SELECTED_FEATURES, transformBatch } from "./preprocess.js";
+
+const app = express();
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json({ limit: "4mb" }));
+
+// ===== ENV =====
+const {
+  PORT = 8080,
+
+  // Cosmos DB for MongoDB
+  COSMOS_MONGO_URI,
+  COSMOS_DB = "appdb",
+  COSMOS_USERS = "users",
+
+  // JWT
+  JWT_SECRET,
+  JWT_EXPIRES_IN = "1h",
+
+  // Azure ML Claim Endpoint
+  AML_CLAIM_URI,
+  AML_CLAIM_KEY,
+  AML_CLAIM_DEPLOYMENT,
+  // choose: mlflow_split | mlflow | inputs
+  AML_CLAIM_PAYLOAD_STYLE = "mlflow_split",
+
+  // (Provider endpoint stubbed for now)
+  AML_PROVIDER_URI,
+  AML_PROVIDER_KEY,
+  AML_PROVIDER_DEPLOYMENT
+} = process.env;
+
+// ===== Mongo (Cosmos for Mongo API) =====
+let usersCollection = null;
+if (!COSMOS_MONGO_URI) {
+  console.warn("⚠️ COSMOS_MONGO_URI not set — /auth routes will fail until you add it to .env");
+} else {
+  const mongo = new MongoClient(COSMOS_MONGO_URI);
+  mongo
+    .connect()
+    .then(() => {
+      usersCollection = mongo.db(COSMOS_DB).collection(COSMOS_USERS);
+      console.log("Mongo connected");
+    })
+    .catch((err) => {
+      console.error("Mongo init error:", err);
+      process.exit(1);
+    });
+}
+
+// ===== Utils =====
+const hashPassword = (pw) => crypto.createHash("sha256").update(String(pw)).digest("hex");
+
+async function callAML(uri, key, deployment, payload) {
+  if (!uri) throw new Error("AML scoring URI not set");
+  const headers = { "Content-Type": "application/json", Accept: "application/json" };
+  if (key) headers["Authorization"] = `Bearer ${key}`;
+  if (deployment) headers["azureml-model-deployment"] = deployment;
+
+  const r = await fetch(uri, { method: "POST", headers, body: JSON.stringify(payload) });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`AML ${r.status}: ${text}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+// ===== JWT =====
+function signToken(payload) {
+  if (!JWT_SECRET) throw new Error("JWT_SECRET not set");
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+function auth(req, res, next) {
+  const hdr = req.headers.authorization || "";
+  const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing/invalid Authorization header" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// ===== Routes =====
+app.get("/", (_req, res) =>
+  res.send("Backend running 🚀 Try /health, /auth/signup, /auth/login, /predict/claim, /debug/transform-claim")
+);
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// --- Auth
+app.post("/auth/signup", async (req, res) => {
+  try {
+    if (!usersCollection) throw new Error("Mongo not configured");
+    const { email, password, name = "" } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "email & password required" });
+
+    const id = String(email).toLowerCase();
+    await usersCollection.insertOne({
+      _id: id,
+      email: id,
+      name,
+      pw: hashPassword(password),
+      createdAt: new Date(),
+    });
+
+    const token = signToken({ email: id });
+    res.json({ ok: true, token });
+  } catch (e) {
+    if (String(e?.code) === "11000") return res.status(409).json({ error: "email exists" });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    if (!usersCollection) throw new Error("Mongo not configured");
+    const { email, password } = req.body || {};
+    const id = String(email || "").toLowerCase();
+    const user = await usersCollection.findOne({ _id: id });
+    if (!user || user.pw !== hashPassword(password)) {
+      return res.status(401).json({ error: "invalid creds" });
+    }
+    const token = signToken({ email: id });
+    res.json({ ok: true, token });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Claim-level predict (JSON body; partial columns allowed)
+app.post("/predict/claim", auth, async (req, res) => {
+  try {
+    if (!req.body || typeof req.body !== "object") {
+      return res.status(400).json({
+        error: "bad-request",
+        message: "Send JSON body: either a single object or an array of objects",
+      });
+    }
+    const rawRows = Array.isArray(req.body) ? req.body : [req.body];
+
+    // Keep only the columns that appear in SELECTED_FEATURES; missing ones become undefined/0
+    const sanitized = rawRows.map((row) => {
+      const r = {};
+      for (const k of SELECTED_FEATURES) {
+        if (Object.prototype.hasOwnProperty.call(row, k)) r[k] = row[k];
+      }
+      return r;
+    });
+
+    // Transform using your bundle (label encoders + scaler w/ null/NaN guards)
+    const X = transformBatch(sanitized);
+
+    // Force float & finite
+    const Xfloat = X.map((row) => row.map((v) => (Number.isFinite(v) ? Number(v) : 0)));
+
+    // AML payload (3 common schemas)
+    let payload;
+    switch ((AML_CLAIM_PAYLOAD_STYLE || "mlflow_split").toLowerCase()) {
+      case "mlflow_split":
+        payload = {
+          input_data: {
+            columns: SELECTED_FEATURES,
+            index: Array.from({ length: Xfloat.length }, (_, i) => i),
+            data: Xfloat,
+          },
+        };
+        break;
+      case "mlflow":
+        payload = { input_data: { columns: SELECTED_FEATURES, data: Xfloat } };
+        break;
+      default: // "inputs"
+        payload = { inputs: Xfloat };
+    }
+
+    const out = await callAML(AML_CLAIM_URI, AML_CLAIM_KEY, AML_CLAIM_DEPLOYMENT, payload);
+    res.json({
+      ok: true,
+      predictions: out,
+      meta: { rows: Xfloat.length, cols: SELECTED_FEATURES.length, payloadStyle: AML_CLAIM_PAYLOAD_STYLE },
+    });
+  } catch (e) {
+    res.status(502).json({
+      error: "claim-scorer-failed",
+      message: e.message,
+      suggestions: [
+        "Ensure preprocessing_bundle.json is in the same folder as server.js.",
+        "If AML complains about schema, try AML_CLAIM_PAYLOAD_STYLE=mlflow_split (default), then mlflow, then inputs in .env.",
+      ],
+    });
+  }
+});
+
+// --- Debug: show the numeric vectors we send to AML
+app.post("/debug/transform-claim", auth, (req, res) => {
+  try {
+    const rawRows = Array.isArray(req.body) ? req.body : [req.body];
+    const sanitized = rawRows.map((row) => {
+      const r = {};
+      for (const k of SELECTED_FEATURES) if (k in row) r[k] = row[k];
+      return r;
+    });
+    const X = transformBatch(sanitized);
+    res.json({
+      ok: true,
+      selected_features: SELECTED_FEATURES,
+      vectors: X,
+      rows: X.length,
+      cols: SELECTED_FEATURES.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Provider-level predict (stub until you share the aggregator)
+app.post("/predict/provider", auth, async (_req, res) => {
+  res.json({ ok: true, note: "Provider route stubbed. Send the provider aggregation code to wire it." });
+});
+
+app.listen(Number(PORT), () => console.log(`server.js listening on http://localhost:${PORT}`));
